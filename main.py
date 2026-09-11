@@ -115,14 +115,25 @@ def main(page: ft.Page):
         client_name = client["name"] if client else None
 
         items = order.get("items") or []
-        item_rows = [
-            ft.Row(
-                [
-                    ft.Text(f"{i.get('qty', 0):g}x {i.get('type', 'Item')}", size=13, color=INK),
-                ],
-            )
-            for i in items
-        ] or [ft.Text("No items logged yet.", size=12.5, color=MUTED)]
+
+        def item_row(i):
+            label = f"{i.get('qty', 0):g}x {i.get('type', 'Item')}"
+            total = i.get("total")
+            if total is not None:
+                return ft.Row(
+                    [
+                        ft.Text(label, size=13, color=INK),
+                        ft.Text(f"₱{total:.2f}", size=13, weight=ft.FontWeight.BOLD, color=INK),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                )
+            # Older orders saved before per-item pricing was tracked -
+            # fall back to showing just the item with no price.
+            return ft.Row([ft.Text(label, size=13, color=INK)])
+
+        item_rows = [item_row(i) for i in items] or [
+            ft.Text("No items logged yet.", size=12.5, color=MUTED)
+        ]
 
         status = order.get("status", "Dropped Off")
         badge_color = {

@@ -52,6 +52,11 @@ TABS = ["Sales", "Cashbox", "Orders", "Services"]
 RANGES = [("today", "Today"), ("7d", "7 days"), ("month", "This month"), ("all", "All time")]
 
 
+# Newer Flet versions removed ElevatedButton and ft.app(); these keep the
+# file working on both old and new Flet.
+Button = getattr(ft, "Button", None) or ft.ElevatedButton
+
+
 def border_all(width, color):
     side = ft.BorderSide(width, color)
     return ft.Border(left=side, top=side, right=side, bottom=side)
@@ -148,7 +153,7 @@ def main(page: ft.Page):
             bgcolor=accent if selected else "white",
             border=border_all(1, accent if selected else LINE),
             border_radius=9, padding=ft.Padding(8, 9, 8, 9),
-            alignment=ft.alignment.Alignment(0, 0), expand=True,
+            alignment=ft.Alignment(0, 0), expand=True,
             on_click=on_click,
         )
 
@@ -163,7 +168,7 @@ def main(page: ft.Page):
                 spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             bgcolor=TEAL, padding=ft.Padding(24, 28, 24, 24),
-            alignment=ft.alignment.Alignment(0, 0), width=page.width,
+            alignment=ft.Alignment(0, 0), width=page.width,
         )
         page.controls.clear()
         page.add(
@@ -207,7 +212,7 @@ def main(page: ft.Page):
                 ft.TextField(label="Password", password=True, can_reveal_password=True,
                              on_change=on_pw, on_submit=try_login, autofocus=True),
                 ft.Text(state["pw_error"], size=12, color=CORAL, weight=ft.FontWeight.W_600),
-                ft.ElevatedButton("Open reports", bgcolor=TEAL, color="white", on_click=try_login),
+                Button("Open reports", bgcolor=TEAL, color="white", on_click=try_login),
             ])
         ])
 
@@ -395,12 +400,14 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
+    # Flet 1.x replaced ft.app() with ft.run(); fall back for older versions.
+    run_app = getattr(ft, "run", None) or ft.app
     if os.environ.get("PORT"):
-        ft.app(
-            target=main,
+        run_app(
+            main,
             view=ft.AppView.WEB_BROWSER,
             host="0.0.0.0",
             port=int(os.environ.get("PORT", 8000)),
         )
     else:
-        ft.app(target=main, view=ft.AppView.WEB_BROWSER)
+        run_app(main, view=ft.AppView.WEB_BROWSER)

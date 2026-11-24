@@ -170,3 +170,26 @@ def get_report_data(start_date, end_date, cash_limit=50):
                 pass
 
     return out
+
+
+def get_calendar_data(year, month):
+    """Paid orders per day for one calendar month (Manila dates)."""
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    start_ts, end_ts = day_range_to_epoch(first, nxt - timedelta(days=1))
+
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            """SELECT (to_timestamp(paid_at) AT TIME ZONE 'Asia/Manila')::date AS d,
+                      COUNT(*) AS n,
+                      COALESCE(SUM(price), 0) AS total
+               FROM orders
+               WHERE status = 'Picked Up' AND paid_at IS NOT NULL
+                     AND paid_at >= %s AND paid_at < %s
+               GROUP BY 1""",
+            (start_ts, end_ts),
+        )
+        days = {r[0]: {"count": int(r[1]), "total": round(float(r[2]), 2)}
+                for r in c.fetchall()}
+    return {"days": days}

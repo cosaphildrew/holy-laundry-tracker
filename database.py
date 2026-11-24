@@ -1,18 +1,8 @@
 """
-Holy Laundry - Database Module (tracker-site copy)
+Holy Laundry - Reports site database module (READ-ONLY)
 
-This is the SAME database module used by the main Holy Laundry app,
-pointed at the SAME Postgres database via DATABASE_URL. It's duplicated
-here (rather than imported across projects) so this tracker site can be
-deployed completely independently from the staff app.
-
-Only two functions were added at the bottom that don't exist in the main
-app's copy: get_client_by_id() and get_service_by_id(). Both are simple
-read-only lookups (no writes, no schema changes) added so the public
-tracking page can show a client's name and a service's name without
-pulling every client/service row. If you ever update the main app's
-database.py, you can safely copy those two functions over here too - they
-don't touch anything the main app relies on.
+Same Postgres database and same DATABASE_URL as the staff app, but this site
+only ever reads. Nothing here inserts, updates or deletes.
 
 Driver: pg8000 (pure Python - no C extension required).
 """
@@ -20,11 +10,14 @@ Driver: pg8000 (pure Python - no C extension required).
 import os
 import json
 import ssl
-from datetime import datetime
+from datetime import datetime, timedelta, timezone, date, time
 from contextlib import contextmanager
 from urllib.parse import urlparse, unquote
 
 import pg8000
+
+# Philippine time. Reports group days by Manila date, not UTC.
+PH_TZ = timezone(timedelta(hours=8))
 
 
 def _get_database_url():
@@ -43,8 +36,7 @@ def _parse_connect_args(url):
     ssl_context = None
     query = parsed.query or ""
     if "sslmode=disable" not in query:
-        ctx = ssl.create_default_context()
-        ssl_context = ctx
+        ssl_context = ssl.create_default_context()
 
     return {
         "user": unquote(parsed.username) if parsed.username else None,
@@ -53,6 +45,7 @@ def _parse_connect_args(url):
         "port": parsed.port or 5432,
         "database": parsed.path.lstrip("/") if parsed.path else None,
         "ssl_context": ssl_context,
+        "timeout": 30,
     }
 
 
@@ -80,63 +73,100 @@ def get_conn():
         conn.close()
 
 
-# ---------------------------------------------------------------- ORDERS
-def get_order_by_tracking_number(tracking_number):
-    """Look up a single order by its printed tracking number. Returns None
-    if no order matches. This is the only lookup the tracker site needs
-    for the order itself."""
+def day_range_to_epoch(start_date, end_date):
+    """Inclusive Manila dates -> (start_ts, end_ts) epoch seconds, where
+    end_ts is the start of the day AFTER end_date."""
+    start = datetime.combine(start_date, time.min, tzinfo=PH_TZ)
+    end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=PH_TZ)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def get_report_data(start_date, end_date, cash_limit=50):
+    """Everything the reports need, over ONE connection.
+
+    Sales/services use orders that were PAID (status Picked Up with a paid_at
+    time) inside the date range. Status counts and the cashbox are not
+    date-filtered: they show the situation right now.
+    """
+    start_ts, end_ts = day_range_to_epoch(start_date, end_date)
+    out = {}
+
     with get_conn() as conn:
         c = conn.cursor()
+
+        # --- sales per day per payment method ---
         c.execute(
-            """SELECT id, client_id, service_id, items, drop_off_date, due_date, price, notes,
-                      status, is_rush, tracking_number, created_at
-               FROM orders WHERE tracking_number = %s""",
-            (tracking_number,),
+            """SELECT (to_timestamp(paid_at) AT TIME ZONE 'Asia/Manila')::date AS d,
+                      COALESCE(payment_method, 'Unknown') AS method,
+                      COUNT(*) AS n,
+                      COALESCE(SUM(price), 0) AS total
+               FROM orders
+               WHERE status = 'Picked Up' AND paid_at IS NOT NULL
+                     AND paid_at >= %s AND paid_at < %s
+               GROUP BY 1, 2
+               ORDER BY 1 DESC, 2""",
+            (start_ts, end_ts),
         )
-        row = c.fetchone()
-    if not row:
-        return None
-    return {
-        "id": row[0],
-        "client_id": row[1],
-        "service_id": row[2],
-        "items": json.loads(row[3]) if isinstance(row[3], str) else row[3],
-        "drop_off_date": row[4],
-        "due_date": row[5],
-        "price": float(row[6]) if row[6] else 0,
-        "notes": row[7],
-        "status": row[8],
-        "is_rush": row[9] if len(row) > 9 else False,
-        "tracking_number": row[10] if len(row) > 10 else None,
-        "created_at": row[11],
-    }
+        out["sales"] = [
+            {"date": r[0], "method": r[1], "count": int(r[2]), "total": round(float(r[3]), 2)}
+            for r in c.fetchall()
+        ]
 
+        # --- items of paid orders (for sales per service) ---
+        c.execute(
+            """SELECT items FROM orders
+               WHERE status = 'Picked Up' AND paid_at IS NOT NULL
+                     AND paid_at >= %s AND paid_at < %s""",
+            (start_ts, end_ts),
+        )
+        paid_items = []
+        for (raw,) in c.fetchall():
+            try:
+                items = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            except ValueError:
+                items = []
+            paid_items.append(items)
+        out["paid_items"] = paid_items
 
-# ---------------------------------------------------------- ADDED HELPERS
-def get_client_by_id(client_id):
-    """Read-only lookup of a single client's public-safe fields (name
-    only - phone/address are deliberately left out since this is called
-    from a public, unauthenticated page)."""
-    if not client_id:
-        return None
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT name FROM clients WHERE id = %s", (client_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"name": row[0]}
+        c.execute("SELECT name, unit, price FROM services")
+        out["services"] = {r[0]: {"unit": r[1], "price": float(r[2])} for r in c.fetchall()}
 
+        # --- orders by status (right now) ---
+        c.execute(
+            """SELECT COALESCE(status, 'Unknown'), COUNT(*),
+                      COUNT(*) FILTER (WHERE is_rush)
+               FROM orders GROUP BY 1"""
+        )
+        out["status_counts"] = {r[0]: {"count": int(r[1]), "rush": int(r[2])} for r in c.fetchall()}
 
-def get_service_by_id(service_id):
-    """Read-only lookup of a single service's name/unit (used only as a
-    fallback label; order items already store their own type/qty)."""
-    if not service_id:
-        return None
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT name, unit FROM services WHERE id = %s", (service_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"name": row[0], "unit": row[1]}
+        # --- cashbox (right now). In a SAVEPOINT so that a missing
+        # cash_ledger table can't break the other reports. ---
+        out["cash_error"] = None
+        out["cash_balance"] = 0.0
+        out["cash_entries"] = []
+        try:
+            c.execute("SAVEPOINT cashbox")
+            c.execute("SELECT COALESCE(SUM(amount), 0) FROM cash_ledger")
+            out["cash_balance"] = float(c.fetchone()[0])
+            c.execute(
+                "SELECT created_at, entry_type, amount, tendered, change_given, note "
+                "FROM cash_ledger ORDER BY id DESC LIMIT %s",
+                (cash_limit,),
+            )
+            out["cash_entries"] = [
+                {"created_at": r[0], "entry_type": r[1], "amount": float(r[2]),
+                 "tendered": None if r[3] is None else float(r[3]),
+                 "change_given": None if r[4] is None else float(r[4]),
+                 "note": r[5] or ""}
+                for r in c.fetchall()
+            ]
+            c.execute("RELEASE SAVEPOINT cashbox")
+        except Exception as e:
+            print(f"[DB] Could not read cash_ledger: {e}")
+            out["cash_error"] = str(e)
+            try:
+                c.execute("ROLLBACK TO SAVEPOINT cashbox")
+            except Exception:
+                pass
+
+    return out

@@ -7,6 +7,7 @@ password, then can view:
   - Cashbox:   cash that should be in the box + recent movements
   - Orders:    how many orders are in each stage right now
   - Services:  quantity and estimated revenue per service
+  - Calendar:  customers and total per day, weekly totals, monthly grand total
 
 READ-ONLY: it reads the same Postgres database as the staff app (same
 DATABASE_URL) and never writes to it.
@@ -48,7 +49,8 @@ MUTED = "#6F8688"
 BG = "#EFF5F5"
 LINE = "#E2EBEC"
 
-TABS = ["Sales", "Cashbox", "Orders", "Services"]
+TABS = ["Sales", "Cashbox", "Orders", "Services", "Calendar"]
+CAL_TAB = 4
 RANGES = [("today", "Today"), ("7d", "7 days"), ("month", "This month"), ("all", "All time")]
 
 
@@ -104,6 +106,9 @@ def main(page: ft.Page):
         "tab": 0,
         "range": "today",
         "data": None,
+        "cal": None,
+        "cal_year": ph_today().year,
+        "cal_month": ph_today().month,
         "error": "",
     }
 
@@ -113,12 +118,18 @@ def main(page: ft.Page):
 
     # ---------------------------------------------------------- data
     def load_data():
-        s, e = range_dates(state["range"])
         try:
-            state["data"] = db.get_report_data(s, e)
+            if state["tab"] == CAL_TAB:
+                state["cal"] = db.get_calendar_data(state["cal_year"], state["cal_month"])
+            else:
+                s, e = range_dates(state["range"])
+                state["data"] = db.get_report_data(s, e)
             state["error"] = ""
         except Exception as err:
-            state["data"] = None
+            if state["tab"] == CAL_TAB:
+                state["cal"] = None
+            else:
+                state["data"] = None
             state["error"] = f"Could not load reports: {err}"
 
     def reload_and_render(e=None):
@@ -343,10 +354,109 @@ def main(page: ft.Page):
                     size=11, color=MUTED, text_align=ft.TextAlign.CENTER),
         ]
 
+    def view_calendar(d):
+        y, m = state["cal_year"], state["cal_month"]
+        days = d["days"]
+        first = datetime.date(y, m, 1)
+        nxt = datetime.date(y + 1, 1, 1) if m == 12 else datetime.date(y, m + 1, 1)
+        offset = (first.weekday() + 1) % 7  # weeks start on Sunday
+        cells = [None] * offset + [first + datetime.timedelta(days=i)
+                                   for i in range((nxt - first).days)]
+        while len(cells) % 7:
+            cells.append(None)
+        weeks = [cells[i:i + 7] for i in range(0, len(cells), 7)]
+
+        month_total = round(sum(v["total"] for v in days.values()), 2)
+        month_count = sum(v["count"] for v in days.values())
+
+        def go_month(delta):
+            idx = state["cal_year"] * 12 + (state["cal_month"] - 1) + delta
+            state["cal_year"], state["cal_month"] = idx // 12, idx % 12 + 1
+            reload_and_render()
+
+        nav = ft.Row(
+            [
+                chip("‹ Prev", False, lambda e: go_month(-1)),
+                ft.Container(
+                    content=ft.Text(first.strftime("%B %Y"), size=14,
+                                    weight=ft.FontWeight.BOLD, color=INK),
+                    expand=2, alignment=ft.Alignment(0, 0),
+                ),
+                chip("Next ›", False, lambda e: go_month(1)),
+            ],
+            spacing=6,
+        )
+
+        def day_cell(day):
+            if day is None:
+                return ft.Container(expand=True)
+            v = days.get(day) or {"count": 0, "total": 0.0}
+            has = v["count"] > 0
+            return ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(str(day.day), size=11, weight=ft.FontWeight.BOLD, color=INK),
+                        ft.Container(
+                            content=ft.Text(str(v["count"]) if has else "-", size=10,
+                                            color=INK if has else MUTED),
+                            bgcolor=CORAL_SOFT, border_radius=4,
+                            padding=ft.Padding(0, 2, 0, 2), alignment=ft.Alignment(0, 0),
+                        ),
+                        ft.Container(
+                            content=ft.Text(f"{v['total']:,.0f}" if has else "-", size=9,
+                                            weight=ft.FontWeight.W_600,
+                                            color=GREEN if has else MUTED),
+                            bgcolor="#DDF0E3", border_radius=4,
+                            padding=ft.Padding(0, 2, 0, 2), alignment=ft.Alignment(0, 0),
+                        ),
+                    ],
+                    spacing=2, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                ),
+                expand=True, border=border_all(1, LINE), border_radius=6,
+                padding=ft.Padding(3, 3, 3, 3), bgcolor="white",
+            )
+
+        header = ft.Row(
+            [ft.Container(content=ft.Text(n, size=10, weight=ft.FontWeight.BOLD, color=MUTED),
+                          expand=True, alignment=ft.Alignment(0, 0))
+             for n in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]],
+            spacing=3,
+        )
+
+        out = [
+            nav,
+            card([
+                label(f"GRAND TOTAL - {first.strftime('%B %Y').upper()}"),
+                ft.Text(money(month_total), size=30, weight=ft.FontWeight.BOLD, color=TEAL),
+                ft.Text(f"{month_count} customer(s)", size=12, color=MUTED),
+            ]),
+            header,
+        ]
+        for n, wk in enumerate(weeks, 1):
+            real = [x for x in wk if x]
+            w_count = sum((days.get(x) or {}).get("count", 0) for x in real)
+            w_total = round(sum((days.get(x) or {}).get("total", 0.0) for x in real), 2)
+            out.append(card(
+                [
+                    ft.Row([day_cell(x) for x in wk], spacing=3,
+                           vertical_alignment=ft.CrossAxisAlignment.START),
+                    row_lr(f"Week {n} ({real[0].day}-{real[-1].day}) · {w_count} cust.",
+                           money(w_total), size=12),
+                ],
+                padding=10,
+            ))
+        out.append(ft.Text("Pink = customers (paid orders), green = total amount for the day.",
+                           size=11, color=MUTED, text_align=ft.TextAlign.CENTER))
+        return out
+
     # ---------------------------------------------------------- render
     def set_tab(i):
+        need_load = (i == CAL_TAB) or state["data"] is None
         state["tab"] = i
-        render()
+        if need_load:
+            reload_and_render()
+        else:
+            render()
 
     def set_range(key):
         state["range"] = key
@@ -355,6 +465,7 @@ def main(page: ft.Page):
     def lock(e=None):
         state["unlocked"] = False
         state["data"] = None
+        state["cal"] = None
         show_login()
 
     def render():
@@ -376,13 +487,14 @@ def main(page: ft.Page):
                 spacing=6,
             ))
 
+        data = state["cal"] if state["tab"] == CAL_TAB else state["data"]
         if state["error"]:
             children.append(card([ft.Text(state["error"], size=12.5, color=CORAL, selectable=True)],
                                  bg=CORAL_SOFT, border=CORAL))
-        elif state["data"] is not None:
-            views = [view_sales, view_cashbox, view_orders, view_services]
+        elif data is not None:
+            views = [view_sales, view_cashbox, view_orders, view_services, view_calendar]
             try:
-                children += views[state["tab"]](state["data"])
+                children += views[state["tab"]](data)
             except Exception as err:
                 children.append(card([ft.Text(f"Could not show this report: {err}",
                                               size=12.5, color=CORAL, selectable=True)]))
